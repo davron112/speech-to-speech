@@ -873,3 +873,37 @@ def test_session_end_forgets_last_language(monkeypatch):
     handler._voice_for("en")
     handler.on_session_end()
     assert handler._voice_for(None)[0].name == "german"
+
+
+def _streaming_handler(chunks):
+    import torch
+
+    model = SimpleNamespace(
+        sample_rate=10,
+        generate_audio_stream=lambda *_args, **_kwargs: iter(torch.ones(n) for n in chunks),
+    )
+    handler = PocketTTSHandler.__new__(PocketTTSHandler)
+    handler.cancel_scope = None
+    handler.max_tokens = 50
+    handler.max_seconds_per_char = 0.5
+    handler.max_extra_seconds = 1.0
+    handler._voice_for = lambda _code: (model, object())
+    return handler
+
+
+def test_runaway_generation_is_cut_at_the_audio_cap():
+    """A sentence whose end of speech is missed stops at len(text) * per-char + extra seconds."""
+    handler = _streaming_handler([20] * 100)
+
+    samples = sum(chunk.numel() for chunk in handler._generate_audio("abcd", None))
+
+    assert samples == 30
+
+
+def test_normal_generation_is_untouched_by_the_audio_cap():
+    """Audio that ends within the cap streams through unchanged."""
+    handler = _streaming_handler([5, 5])
+
+    chunks = list(handler._generate_audio("abcd", None))
+
+    assert [chunk.numel() for chunk in chunks] == [5, 5]

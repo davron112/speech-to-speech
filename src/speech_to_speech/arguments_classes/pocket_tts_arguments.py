@@ -1,5 +1,8 @@
 from dataclasses import dataclass, field
 
+DEFAULT_MAX_SECONDS_PER_CHAR = 0.25
+DEFAULT_MAX_EXTRA_SECONDS = 2.0
+
 
 @dataclass
 class PocketTTSHandlerArguments:
@@ -48,6 +51,17 @@ class PocketTTSHandlerArguments:
     pocket_tts_temperature: float | None = field(
         default=None,
         metadata={"help": "Sampling temperature. Uses the model config default when unset, 0.3 for Farsi v2."},
+    )
+    pocket_tts_max_seconds_per_char: float = field(
+        default=DEFAULT_MAX_SECONDS_PER_CHAR,
+        metadata={
+            "help": "Audio length cap per input character. A sentence whose end of speech the model misses stops at "
+            "len(text) * this + pocket_tts_max_extra_seconds instead of streaming for a minute. Default is 0.25."
+        },
+    )
+    pocket_tts_max_extra_seconds: float = field(
+        default=DEFAULT_MAX_EXTRA_SECONDS,
+        metadata={"help": "Fixed seconds added to the per-character audio length cap. Default is 2.0."},
     )
     pocket_tts_eos_threshold: float | None = field(
         default=None,

@@ -8,6 +8,10 @@ from typing import Any, Callable, Iterator, cast
 
 import numpy as np
 
+from speech_to_speech.arguments_classes.pocket_tts_arguments import (
+    DEFAULT_MAX_EXTRA_SECONDS,
+    DEFAULT_MAX_SECONDS_PER_CHAR,
+)
 from speech_to_speech.baseHandler import BaseHandler
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.console import console
@@ -40,6 +44,9 @@ class PocketTTSHandler(BaseHandler[TTSIn, TTSOut]):
     Supports streaming audio generation with voice cloning.
     """
 
+    max_seconds_per_char: float = DEFAULT_MAX_SECONDS_PER_CHAR
+    max_extra_seconds: float = DEFAULT_MAX_EXTRA_SECONDS
+
     def setup(
         self,
         should_listen: Event,
@@ -56,6 +63,8 @@ class PocketTTSHandler(BaseHandler[TTSIn, TTSOut]):
         temperature: float | None = None,
         eos_threshold: float | None = None,
         extra_languages: str = "",
+        max_seconds_per_char: float = DEFAULT_MAX_SECONDS_PER_CHAR,
+        max_extra_seconds: float = DEFAULT_MAX_EXTRA_SECONDS,
     ) -> None:
         """
         Initialize Pocket TTS handler.
@@ -93,6 +102,8 @@ class PocketTTSHandler(BaseHandler[TTSIn, TTSOut]):
         self.model_name = model_name
         self.is_farsi = model_name == "mehdi-hf/pocket-tts-farsi-v2"
         self.max_tokens = min(max_tokens, 18) if self.is_farsi else max_tokens
+        self.max_seconds_per_char = max_seconds_per_char
+        self.max_extra_seconds = max_extra_seconds
         self.phonemizer: PersianPhonemizer | None = None
         extra = [name.strip() for name in extra_languages.split(",") if name.strip() and name.strip() != language]
         if self.is_farsi and extra:
@@ -204,6 +215,7 @@ class PocketTTSHandler(BaseHandler[TTSIn, TTSOut]):
         if phonemizer is None:
             if not cancelled():
                 model, voice_state = self._voice_for(language_code)
+                samples_left = int(self._audio_cap_seconds(text) * model.sample_rate)
                 for audio in model.generate_audio_stream(
                     voice_state,
                     text,
@@ -215,6 +227,15 @@ class PocketTTSHandler(BaseHandler[TTSIn, TTSOut]):
                     if on_first_provider_audio is not None and audio.numel():
                         on_first_provider_audio(perf_counter())
                         on_first_provider_audio = None
+                    if audio.numel() >= samples_left:
+                        logger.warning(
+                            "Pocket TTS hit the %.1fs audio cap for a %d-char sentence; cutting it off",
+                            self._audio_cap_seconds(text),
+                            len(text),
+                        )
+                        yield audio.reshape(-1)[:samples_left]
+                        return
+                    samples_left -= audio.numel()
                     yield audio
             return
 
@@ -324,6 +345,9 @@ class PocketTTSHandler(BaseHandler[TTSIn, TTSOut]):
         raise RuntimeError(
             "Pocket TTS Farsi generation was silent or reached its length cap twice. Shorten the phrase or try another reference."
         )
+
+    def _audio_cap_seconds(self, text: str) -> float:
+        return len(text) * self.max_seconds_per_char + self.max_extra_seconds
 
     @property
     def min_time_to_debug(self) -> float:
