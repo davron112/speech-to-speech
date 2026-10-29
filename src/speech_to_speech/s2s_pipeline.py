@@ -490,6 +490,7 @@ def _build_handlers(
             setup_kwargs={
                 "text_output_queue": text_output_queue,
                 "should_listen": should_listen,
+                "ignored_transcripts": module_kwargs.ignored_transcripts,
             },
         )
         if resource_ledger is not None:

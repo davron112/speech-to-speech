@@ -135,6 +135,14 @@ class ModuleArguments(Wav2Vec2STVHandlerArguments):
             "timeout (generation may take minutes). Default is 10.0."
         },
     )
+    ignored_transcripts: str = field(
+        default="",
+        metadata={
+            "help": "Comma-separated transcripts treated as no speech (case and punctuation are ignored), e.g. "
+            "the fillers an STT model hallucinates from background noise: 'yeah,mm-hmm,thank you'. A turn whose "
+            "whole transcript matches one entry does not reach the LLM. Default is empty."
+        },
+    )
     num_pipelines: int = field(
         default=1,
         metadata={

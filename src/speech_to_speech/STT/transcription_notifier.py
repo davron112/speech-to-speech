@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from queue import Queue
 from threading import Event
 from typing import Iterator
@@ -23,6 +24,10 @@ from speech_to_speech.pipeline.transcript_logging import transcript_for_log
 logger = logging.getLogger(__name__)
 
 
+def _normalize(text: str) -> str:
+    return " ".join(re.sub(r"[^\w\s]", " ", text.lower()).split())
+
+
 class TranscriptionNotifier(BaseHandler[STTOut, LLMIn]):
     """Sits between STT and LLM.
 
@@ -35,9 +40,13 @@ class TranscriptionNotifier(BaseHandler[STTOut, LLMIn]):
         self,
         text_output_queue: Queue[TextEventItem] | None = None,
         should_listen: Event | None = None,
+        ignored_transcripts: str = "",
     ) -> None:
         self.text_output_queue = text_output_queue
         self.should_listen = should_listen
+        self.ignored_transcripts = {
+            normalized for phrase in ignored_transcripts.split(",") if (normalized := _normalize(phrase))
+        }
 
     def process(self, transcription: STTOut) -> Iterator[LLMIn]:
         if isinstance(transcription, PartialTranscription):
@@ -77,6 +86,9 @@ class TranscriptionNotifier(BaseHandler[STTOut, LLMIn]):
             speech_stopped_at_s = None
 
         transcript = str(text)
+        if transcript and _normalize(transcript) in self.ignored_transcripts:
+            logger.info("Ignoring transcript treated as noise: %s", transcript_for_log(transcript))
+            transcript = ""
         if isinstance(transcription, Transcription) and transcription.speaker_attribution is not None:
             attribution = transcription.speaker_attribution
             speakers = sorted({interval.speaker for interval in attribution.intervals})
