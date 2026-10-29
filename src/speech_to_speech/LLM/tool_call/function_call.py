@@ -323,6 +323,36 @@ def native_function_calls_to_python(text: str) -> str:
     return _NATIVE_FUNCTION_RE.sub(to_call, text)
 
 
+def extract_inline_tool_calls(
+    text: str, function_tools: List[FunctionTool]
+) -> Tuple[str, List[ResponseFunctionToolCall]]:
+    """Pull ``tool_name(arg=...)`` calls a model wrote as plain text out of *text*.
+
+    Only names of the session's tools are matched, so ordinary speech with
+    parentheses is left alone. Matched calls are removed from the text even when
+    they fail validation, because tool syntax must never be spoken.
+    """
+    names = [tool.name for tool in function_tools if tool.name]
+    if not names or "(" not in text:
+        return text, []
+    pattern = re.compile(
+        rf"\b(?:{'|'.join(map(re.escape, names))})\((?:[^()\"']|\"(?:\\.|[^\"])*\"|'(?:\\.|[^'])*')*\)"
+    )
+    calls: List[ResponseFunctionToolCall] = []
+
+    def take(match: re.Match[str]) -> str:
+        try:
+            calls.extend(
+                call.to_realtime_function_tool_call(function_tools) for call in parse_function_call(match.group(0))
+            )
+        except Exception as exc:
+            logger.warning("Dropping invalid inline tool call %r: %s", match.group(0), exc)
+        return " "
+
+    remaining = pattern.sub(take, text)
+    return (" ".join(remaining.split()) if remaining != text else text), calls
+
+
 def extract_function_calls_from_text(text: str, block_regex: str = ".*") -> Tuple[str, List[FunctionToolCall]]:
     """Extract function calls from delimited code blocks inside *text*.
 

@@ -4,6 +4,7 @@ from speech_to_speech.LLM.language_model import LanguageModelHandler, StreamCont
 from speech_to_speech.LLM.tool_call.function_call import (
     alias_native_tool_markers,
     extract_function_calls_from_text,
+    extract_inline_tool_calls,
     native_function_calls_to_python,
 )
 from speech_to_speech.LLM.tool_call.function_tool import FunctionTool
@@ -77,3 +78,30 @@ def test_prompted_code_block_still_works():
         f"{ENTER_CODE}dance(move='pendulum'){END_CODE}", None, [], _dance_context()
     )
     assert [tool.name for tool in tools] == ["dance"]
+
+
+def _emotion_tool():
+    return FunctionTool(
+        type="function",
+        name="play_emotion",
+        description="Emotion.",
+        parameters={"type": "object", "properties": {"emotion": {"type": "string"}}},
+    )
+
+
+def test_inline_call_is_extracted_and_removed():
+    text, calls = extract_inline_tool_calls('Ja! play_emotion(emotion="happy1") Super.', [_emotion_tool()])
+    assert text == "Ja! Super."
+    assert [(c.name, json.loads(c.arguments)) for c in calls] == [("play_emotion", {"emotion": "happy1"})]
+
+
+def test_unknown_names_and_plain_parentheses_are_kept():
+    text, calls = extract_inline_tool_calls("Ein Hase (klein) hüpft. dance(x=1)", [_emotion_tool()])
+    assert text == "Ein Hase (klein) hüpft. dance(x=1)"
+    assert calls == []
+
+
+def test_invalid_inline_call_is_still_never_spoken():
+    text, calls = extract_inline_tool_calls("play_emotion(emotion=) Hallo", [_emotion_tool()])
+    assert "play_emotion" not in text
+    assert calls == []

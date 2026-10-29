@@ -38,6 +38,8 @@ from speech_to_speech.LLM.chat import (
 )
 from speech_to_speech.LLM.compaction_prompt import CompactGenerateFn, build_compactor
 from speech_to_speech.LLM.text_prompt import build_text_system_prompt
+from speech_to_speech.LLM.tool_call.function_call import extract_inline_tool_calls
+from speech_to_speech.LLM.tool_call.function_tool import FunctionTool
 from speech_to_speech.LLM.utils import (
     LANGUAGE_INSTRUCTION_TEMPLATE,
     format_language_instruction,
@@ -47,6 +49,7 @@ from speech_to_speech.LLM.utils import (
     remove_unspeechable,
     resolve_auto_language,
     sent_tokenize_preserving_markdown_code,
+    strip_stage_directions,
 )
 from speech_to_speech.LLM.voice_prompt import build_voice_system_prompt
 from speech_to_speech.pipeline.cancel_scope import CancelScope
@@ -355,6 +358,15 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             raise ValueError(f"An API key is required to send the {header!r} header.")
         return {header: key}
 
+    def _function_tools(self, turn: _Turn) -> list[FunctionTool]:
+        """Session function tools a model may also call by writing ``name(args)`` as text."""
+        tools, _ = self._resolve_tools(turn.response, turn.runtime_config)
+        return [
+            FunctionTool(**(tool if isinstance(tool, dict) else tool.model_dump()))
+            for tool in tools or []
+            if (tool.get("type") if isinstance(tool, dict) else getattr(tool, "type", None)) == "function"
+        ]
+
     def _resolve_tools(self, response: Any, runtime_config: Any) -> tuple[Any, Any]:
         """Pick per-response tools over session tools, or none when the backend cannot call tools."""
         if not self.forward_tools:
@@ -644,14 +656,21 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         printable_text = ""
         sentence_batch: list[str] = []
 
+        function_tools = self._function_tools(turn)
+
         def _flush(batch: list[str]) -> Iterator[LLMOut]:
             if not batch:
                 return
             if not self._turn_output_allowed(turn.turn_id, turn.turn_revision):
                 logger.info("LLM generation cancelled (stale speculative turn)")
                 return
-            state.output_emitted = True
-            yield self._chunk(turn, text=" ".join(batch))
+            spoken = [strip_stage_directions(sentence) for sentence in batch]
+            text, inline_calls = extract_inline_tool_calls(" ".join(spoken), function_tools)
+            if text.strip():
+                state.output_emitted = True
+                yield self._chunk(turn, text=text)
+            for call in inline_calls:
+                yield from self._record_tool_call(state, turn, ToolCall(item=call))
 
         for event in events:
             # Provider usage is billable even when cancellation rolls back the

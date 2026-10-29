@@ -1106,3 +1106,41 @@ def test_request_timeout_is_configurable():
     h = _make_handler(request_timeout_s=60.0)
     assert h.request_timeout_s == 60.0
     assert h.request_timeout.read == 60.0
+
+
+_EMOTION_TOOL = [
+    {
+        "type": "function",
+        "name": "play_emotion",
+        "parameters": {"type": "object", "properties": {"emotion": {"type": "string"}}},
+    }
+]
+
+
+def test_tool_call_written_as_text_is_executed_not_spoken():
+    h = _make_handler(stream=True)
+    h.client.chat.completions.create = lambda **k: _FakeStream(
+        [_chunk(content='play_emotion(emotion="loving1")\n'), _chunk(content="Gute Nacht, kleiner Freund!")]
+    )
+    text, tools, _usage, _chat, _end = _drive(h, tools=_EMOTION_TOOL)
+    assert "play_emotion" not in text and "loving1" not in text
+    assert "Gute Nacht, kleiner Freund!" in text
+    assert [(t.name, json.loads(t.arguments)) for t in tools] == [("play_emotion", {"emotion": "loving1"})]
+
+
+def test_text_call_is_left_alone_without_matching_tool():
+    h = _make_handler(stream=True)
+    h.client.chat.completions.create = lambda **k: _FakeStream([_chunk(content="Ich sage (leise) hallo.")])
+    text, tools, _usage, _chat, _end = _drive(h, tools=_EMOTION_TOOL)
+    assert text == "Ich sage (leise) hallo."
+    assert tools == []
+
+
+def test_stage_direction_is_not_spoken():
+    h = _make_handler(stream=True)
+    h.client.chat.completions.create = lambda **k: _FakeStream(
+        [_chunk(content="(Music is playing, so keep it short) "), _chunk(content="Bitte schön!")]
+    )
+    text, _tools, _usage, _chat, _end = _drive(h)
+    assert "Music is playing" not in text
+    assert "Bitte schön!" in text

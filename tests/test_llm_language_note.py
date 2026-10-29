@@ -35,3 +35,11 @@ def test_without_note_or_user_message_input_is_unchanged():
 
 def test_non_list_input_is_passed_through():
     assert insert_before_last_user_message("raw", NOTE) == "raw"
+
+
+def test_leading_bracketed_asides_are_stripped():
+    from speech_to_speech.LLM.utils import strip_stage_directions
+
+    assert strip_stage_directions("(Music is playing, so keep it short)") == ""
+    assert strip_stage_directions("(leise) [lacht] Bitte schön!") == "Bitte schön!"
+    assert strip_stage_directions("Ein Hase (klein) hüpft.") == "Ein Hase (klein) hüpft."

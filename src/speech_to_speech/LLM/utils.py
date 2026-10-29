@@ -263,6 +263,16 @@ def format_language_instruction(lang_name: str, template: str = LANGUAGE_INSTRUC
     return template.format(language=lang_name)
 
 
+_LEADING_STAGE_DIRECTION_RE = re.compile(r"^\s*(?:\([^()]*\)|\[[^\[\]]*\])\s*")
+
+
+def strip_stage_directions(sentence: str) -> str:
+    """Drop bracketed asides that open a sentence, e.g. ``(Music is playing, so keep it short)``."""
+    while (stripped := _LEADING_STAGE_DIRECTION_RE.sub("", sentence, count=1)) != sentence:
+        sentence = stripped
+    return sentence
+
+
 def insert_before_last_user_message(messages: Any, note: Optional[str]) -> Any:
     """Return ``messages`` with a system ``note`` placed right before the latest user message."""
     if not note or not isinstance(messages, list):
