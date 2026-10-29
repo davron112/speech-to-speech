@@ -39,6 +39,9 @@ from speech_to_speech.LLM.chat import (
 from speech_to_speech.LLM.compaction_prompt import CompactGenerateFn, build_compactor
 from speech_to_speech.LLM.text_prompt import build_text_system_prompt
 from speech_to_speech.LLM.utils import (
+    LANGUAGE_INSTRUCTION_TEMPLATE,
+    format_language_instruction,
+    insert_before_last_user_message,
     language_name_for_prompt,
     remove_markdown,
     remove_unspeechable,
@@ -150,6 +153,7 @@ class _Turn(BaseModel):
     # End of the conversation when this turn started; keeps its output ahead of
     # user messages appended while the model was still running.
     history_anchor_id: str | None = None
+    language_note: str | None = None
 
 
 class _GenState(BaseModel):
@@ -178,6 +182,8 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
     usage, out-of-band handling and error termination.
     """
 
+    forward_tools = True
+
     # ── setup ─────────────────────────────────────────────────────────────────
 
     def setup(
@@ -187,6 +193,8 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         gen_kwargs: dict[str, Any] = {},
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
+        api_key_header: Optional[str] = None,
+        forward_tools: bool = True,
         stream: bool = True,
         user_role: str = "user",
         cancel_scope: CancelScope | None = None,
@@ -196,6 +204,8 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         request_timeout_s: float = 20.0,
         stream_batch_sentences: int = 3,
         enable_lang_prompt: bool = False,
+        lang_prompt_position: Literal["system", "before_user"] = "system",
+        lang_note_template: str = LANGUAGE_INSTRUCTION_TEMPLATE,
         compact_history: bool = False,
         audio_max_tokens: int = 256,
         audio_temperature: float = 0.0,
@@ -209,6 +219,10 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         self.stream = stream
         self.stream_batch_sentences = max(1, stream_batch_sentences)
         self.enable_lang_prompt = enable_lang_prompt
+        if lang_prompt_position not in {"system", "before_user"}:
+            raise ValueError("lang_prompt_position must be either 'system' or 'before_user'.")
+        self.lang_prompt_position = lang_prompt_position
+        self.lang_note_template = lang_note_template
         self.gen_kwargs = dict(gen_kwargs)
         self.audio_max_tokens = audio_max_tokens
         self.audio_temperature = audio_temperature
@@ -231,7 +245,9 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             and self._is_local_base_url(base_url)
         ):
             api_key = "none"
-        self.client = OpenAI(api_key=api_key, base_url=base_url)
+        self.forward_tools = forward_tools
+        headers = self._api_key_headers(api_key_header, api_key)
+        self.client = OpenAI(api_key=api_key, base_url=base_url, **({"default_headers": headers} if headers else {}))
         self._extra_body = self._build_extra_body(base_url, disable_thinking, reasoning_effort)
         self._prefetch_worker_slots = BoundedSemaphore(PREFETCH_PROVIDER_WORKER_LIMIT)
         self._prefetch_workers_lock = Lock()
@@ -328,6 +344,28 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             yield from self._iter_stream_events(api_response)
         else:
             yield from self._iter_response_events(api_response)
+
+    @staticmethod
+    def _api_key_headers(header: Optional[str], api_key: Optional[str]) -> Optional[dict[str, str]]:
+        """Send the key in a custom header for gateways that do not accept ``Authorization: Bearer``."""
+        if not header:
+            return None
+        key = api_key or os.environ.get("OPENAI_API_KEY")
+        if not key:
+            raise ValueError(f"An API key is required to send the {header!r} header.")
+        return {header: key}
+
+    def _resolve_tools(self, response: Any, runtime_config: Any) -> tuple[Any, Any]:
+        """Pick per-response tools over session tools, or none when the backend cannot call tools."""
+        if not self.forward_tools:
+            return None, None
+        req_tools = (
+            response.tools if response is not None and response.tools is not None else runtime_config.session.tools
+        )
+        req_tool_choice = (
+            response.tool_choice if response and response.tool_choice else runtime_config.session.tool_choice
+        )
+        return req_tools, req_tool_choice
 
     @abstractmethod
     def _build_optional_kwargs(self, req_tools: Any, req_tool_choice: Any) -> dict[str, Any]:
@@ -510,6 +548,12 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         if self.speculative_turns is None:
             return True
         return self.speculative_turns.wait_for_gate(turn_id, turn_revision)
+
+    def _split_language_prompt(self, lang_name: str | None) -> tuple[str | None, str | None]:
+        """Route the language instruction to the system prompt or to a note before the latest user message."""
+        if lang_name and self.lang_prompt_position == "before_user":
+            return None, format_language_instruction(lang_name, self.lang_note_template)
+        return lang_name, None
 
     def _apply_config(
         self,
@@ -779,7 +823,9 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         try:
             generation_started_at_s = perf_counter()
             try:
-                api_input = (serialize_fn or self._serialize)(active_chat)
+                api_input = insert_before_last_user_message(
+                    (serialize_fn or self._serialize)(active_chat), turn.language_note
+                )
                 # Images the model actually sees this turn; only these are stripped on
                 # write-back, so an image a fast client injects mid-generation for the
                 # next turn survives (it is not in this serialized snapshot).
@@ -973,14 +1019,10 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             if response is not None and response.instructions is not None
             else runtime_config.session.instructions
         ) or ""
-        req_tools = (
-            response.tools if response is not None and response.tools is not None else runtime_config.session.tools
-        )
-        req_tool_choice = (
-            response.tool_choice if response and response.tool_choice else runtime_config.session.tool_choice
-        )
+        req_tools, req_tool_choice = self._resolve_tools(response, runtime_config)
         wants_audio = response_wants_audio(response)
-        self._apply_config(active_chat, instructions, wants_audio, language_name=lang_name)
+        system_lang_name, language_note = self._split_language_prompt(lang_name)
+        self._apply_config(active_chat, instructions, wants_audio, language_name=system_lang_name)
 
         optional_kwargs = self._build_audio_optional_kwargs(response, req_tools, req_tool_choice)
         input_history = None
@@ -1015,6 +1057,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             response_key=request.response_key,
             prefetch_transaction=request.prefetch_transaction,
             history_anchor_id=history_anchor_id,
+            language_note=language_note,
         )
         yield from self._generate(
             active_chat,
@@ -1090,14 +1133,10 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             if response is not None and response.instructions is not None
             else runtime_config.session.instructions
         ) or ""
-        req_tools = (
-            response.tools if response is not None and response.tools is not None else runtime_config.session.tools
-        )
-        req_tool_choice = (
-            response.tool_choice if response and response.tool_choice else runtime_config.session.tool_choice
-        )
+        req_tools, req_tool_choice = self._resolve_tools(response, runtime_config)
         wants_audio = response_wants_audio(response)
-        self._apply_config(active_chat, instructions, wants_audio, language_name=lang_name)
+        system_lang_name, language_note = self._split_language_prompt(lang_name)
+        self._apply_config(active_chat, instructions, wants_audio, language_name=system_lang_name)
 
         optional_kwargs = self._build_optional_kwargs(req_tools, req_tool_choice)
 
@@ -1117,6 +1156,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             response_key=request.response_key,
             prefetch_transaction=request.prefetch_transaction,
             history_anchor_id=history_anchor_id,
+            language_note=language_note,
         )
         yield from self._generate(active_chat, original_chat, turn, optional_kwargs)
 

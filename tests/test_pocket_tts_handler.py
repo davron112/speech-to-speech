@@ -793,3 +793,83 @@ def test_farsi_failure_does_not_block_a_different_response_identity(other_identi
     assert len(calls) == 1
     assert list(handler.process(TTSInput(text="سلام", **identity))) == []
     assert len(calls) == 1
+
+
+def _multilingual_handler(monkeypatch, language, extra_languages):
+    loaded = []
+
+    def fake_load_model(*, language):
+        model = SimpleNamespace(
+            name=language,
+            to=lambda *args, **kwargs: model,
+            get_state_for_audio_prompt=lambda voice: f"{language}:{voice}",
+            sample_rate=24000,
+        )
+        loaded.append(language)
+        return model
+
+    monkeypatch.setitem(
+        sys.modules, "pocket_tts", SimpleNamespace(TTSModel=SimpleNamespace(load_model=fake_load_model))
+    )
+    handler = object.__new__(PocketTTSHandler)
+    handler.setup(should_listen=Event(), voice="alba", language=language, extra_languages=extra_languages)
+    return handler, loaded
+
+
+def test_extra_languages_are_loaded_once(monkeypatch):
+    _, loaded = _multilingual_handler(monkeypatch, "german", "english, german,")
+    assert loaded == ["german", "english"]
+
+
+@pytest.mark.parametrize(
+    ("language_code", "expected"),
+    [("de", "german"), ("en", "english"), ("en-US", "english"), ("fr", "german"), (None, "german")],
+)
+def test_voice_is_selected_by_language_code(monkeypatch, language_code, expected):
+    handler, _ = _multilingual_handler(monkeypatch, "german", "english")
+    model, voice_state = handler._voice_for(language_code)
+    assert model.name == expected
+    assert voice_state == f"{expected}:alba"
+
+
+def test_language_variant_matches_code(monkeypatch):
+    handler, _ = _multilingual_handler(monkeypatch, "english", "german_24l")
+    model, _ = handler._voice_for("de")
+    assert model.name == "german_24l"
+
+
+def test_extra_languages_rejected_with_farsi():
+    with pytest.raises(ValueError, match="extra_languages"):
+        PocketTTSHandler.__new__(PocketTTSHandler).setup(
+            Event(), voice="reference.wav", model_name="mehdi-hf/pocket-tts-farsi-v2", extra_languages="german"
+        )
+
+
+def test_generation_uses_model_for_response_language(monkeypatch):
+    import torch
+
+    from speech_to_speech.pipeline.messages import TTSInput
+
+    handler, _ = _multilingual_handler(monkeypatch, "german", "english")
+    used = []
+    for name, (model, _) in handler._language_voices.items():
+        model.generate_audio_stream = lambda state, text, _name=name, **kwargs: (
+            used.append((_name, state)) or iter([torch.zeros(2400)])
+        )
+    list(handler.process(TTSInput(text="Hello there.", tts_language_code="en")))
+    list(handler.process(TTSInput(text="Hallo du.", tts_language_code="de")))
+    assert used == [("english", "english:alba"), ("german", "german:alba")]
+
+
+def test_missing_language_code_keeps_last_language(monkeypatch):
+    handler, _ = _multilingual_handler(monkeypatch, "german", "english")
+    assert handler._voice_for("en")[0].name == "english"
+    assert handler._voice_for(None)[0].name == "english"
+    assert handler._voice_for("fr")[0].name == "german"
+
+
+def test_session_end_forgets_last_language(monkeypatch):
+    handler, _ = _multilingual_handler(monkeypatch, "german", "english")
+    handler._voice_for("en")
+    handler.on_session_end()
+    assert handler._voice_for(None)[0].name == "german"

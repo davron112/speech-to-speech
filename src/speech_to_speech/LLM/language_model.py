@@ -6,7 +6,7 @@ from collections.abc import Iterable, Iterator, Sized
 from queue import Empty
 from threading import Lock, Thread
 from time import perf_counter
-from typing import Any, Literal, Optional, Protocol, runtime_checkable
+from typing import Any, Literal, Optional, Protocol, Sequence, runtime_checkable
 
 import torch
 from nltk import sent_tokenize
@@ -42,8 +42,9 @@ from speech_to_speech.LLM.chat import (
     make_assistant_message,
 )
 from speech_to_speech.LLM.compaction_prompt import CompactGenerateFn, build_compactor
+from speech_to_speech.LLM.mlx_prompt_cache import MLXPromptCheckpoint
 from speech_to_speech.LLM.text_prompt import build_text_system_prompt
-from speech_to_speech.LLM.tool_call.function_call import extract_function_calls_from_text
+from speech_to_speech.LLM.tool_call.function_call import alias_native_tool_markers, extract_function_calls_from_text
 from speech_to_speech.LLM.tool_call.function_tool import FunctionTool
 from speech_to_speech.LLM.tool_call.tool_prompt import END_CODE, ENTER_CODE, build_block_regex, build_tool_system_prompt
 from speech_to_speech.LLM.utils import (
@@ -78,6 +79,7 @@ try:
     from mlx_lm import generate as mlx_generate
     from mlx_lm import load as mlx_load
     from mlx_lm import stream_generate as mlx_stream_generate
+    from mlx_lm.models.cache import make_prompt_cache as mlx_make_prompt_cache
 
     from speech_to_speech.utils.mlx_lock import MLXLockContext
 
@@ -347,6 +349,9 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 speech_stopped_at_s=ctx.speech_stopped_at_s,
                 cancel_generation=ctx.cancel_generation,
             )
+
+        if ctx.enter_code and ctx.end_code:
+            printable_text = alias_native_tool_markers(printable_text, ctx.enter_code, ctx.end_code)
 
         while ctx.enter_code and ctx.enter_code in printable_text:
             idx = printable_text.index(ctx.enter_code)
@@ -745,6 +750,11 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
         logger.debug("Language model session state reset")
 
 
+def _mlx_forward(model: Any, tokens: Sequence[int], cache: list[Any]) -> None:
+    model(mx.array(list(tokens))[None], cache=cache)
+    mx.eval([layer.state for layer in cache])
+
+
 # ======================================================================
 # Text-only LLM
 # ======================================================================
@@ -774,6 +784,7 @@ class LanguageModelHandler(BaseLanguageModelHandler):
                 raise ImportError("mlx_lm is required for the 'mlx' backend. Install with: pip install mlx-lm")
             self.model, self.tokenizer = mlx_load(model_name)  # type: ignore[assignment, misc]
             self.gen_kwargs = gen_kwargs
+            self._prompt_checkpoint = MLXPromptCheckpoint(self.model, mlx_make_prompt_cache, _mlx_forward)
         else:
             self.torch_dtype = getattr(torch, torch_dtype)
             self.tokenizer = AutoTokenizer.from_pretrained(model_name)  # type: ignore[assignment]
@@ -817,11 +828,13 @@ class LanguageModelHandler(BaseLanguageModelHandler):
 
         if self.backend == "mlx":
             with MLXLockContext(handler_name="MLX-LLM", timeout=10.0):
+                prompt_tokens, prompt_cache = self._checkpointed_prompt(chat_messages, chat_prompt)
                 token_iter = mlx_stream_generate(
                     self.model,  # type: ignore[arg-type]
                     self.tokenizer,  # type: ignore[arg-type]
-                    chat_prompt,  # type: ignore[arg-type]
+                    prompt_tokens,  # type: ignore[arg-type]
                     max_tokens=self.gen_kwargs["max_new_tokens"],
+                    prompt_cache=prompt_cache,
                 )
                 if ctx.prefetch_transaction is not None:
 
@@ -858,6 +871,37 @@ class LanguageModelHandler(BaseLanguageModelHandler):
             self._finish_transformers_generation(thread)
             if self.device == "mps":
                 torch.mps.empty_cache()
+
+    def _checkpointed_prompt(
+        self, chat_messages: list[dict[str, Any]], chat_prompt: str
+    ) -> tuple[str | list[int], list[Any] | None]:
+        """Split the prompt into the part already held by the conversation checkpoint and the rest."""
+        checkpoint = getattr(self, "_prompt_checkpoint", None)
+        if checkpoint is None:
+            return chat_prompt, None
+        tokens = self.tokenizer.encode(chat_prompt, add_special_tokens=False)
+        stable_prompt = self.tokenizer.apply_chat_template(
+            chat_messages, tokenize=False, add_generation_prompt=False, enable_thinking=False
+        )
+        stable = self.tokenizer.encode(stable_prompt, add_special_tokens=False)
+        stable_len = len(stable) if tokens[: len(stable)] == stable else 0
+        remaining, cache = checkpoint.prepare(tokens, stable_len, self._before_last_user_turn(chat_messages, tokens))
+        logger.info("Prompt tokens: %d, reused from checkpoint: %d", len(tokens), checkpoint.reused_tokens)
+        return remaining, cache
+
+    def _before_last_user_turn(self, chat_messages: list[dict[str, Any]], tokens: list[int]) -> list[int]:
+        """Token boundary where the latest user message's text starts, shared by every revision of it."""
+        if not chat_messages or chat_messages[-1].get("role") != "user":
+            return []
+        blank_turn = [*chat_messages[:-1], {**chat_messages[-1], "content": ""}]
+        blank = self.tokenizer.encode(
+            self.tokenizer.apply_chat_template(
+                blank_turn, tokenize=False, add_generation_prompt=False, enable_thinking=False
+            ),
+            add_special_tokens=False,
+        )
+        shared = next((i for i, (a, b) in enumerate(zip(tokens, blank)) if a != b), min(len(tokens), len(blank)))
+        return [shared] if shared else []
 
     def _build_compaction_generate_fn(self) -> CompactGenerateFn:
         if self.backend == "mlx":

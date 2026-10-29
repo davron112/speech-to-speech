@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from typing import Literal, Optional
 
 from speech_to_speech.arguments_classes.language_model_base_arguments import LanguageModelBaseArguments
+from speech_to_speech.LLM.utils import LANGUAGE_INSTRUCTION_TEMPLATE
 
 
 @dataclass
@@ -20,6 +21,35 @@ class ResponsesApiLanguageModelHandlerArguments(LanguageModelBaseArguments):
     responses_api_base_url: Optional[str] = field(
         default=None,
         metadata={"help": "Base URL for the OpenAI-compatible API endpoint. Default is None (uses OpenAI)."},
+    )
+    responses_api_api_key_header: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "HTTP header that carries the API key (e.g. 'x-api-key') for gateways that reject "
+            "'Authorization: Bearer'. The key comes from --responses_api_api_key or OPENAI_API_KEY. Default is None."
+        },
+    )
+    responses_api_forward_tools: bool = field(
+        default=True,
+        metadata={
+            "help": "Forward session tools to the API. Disable for servers without tool-call support "
+            "(e.g. vLLM without --enable-auto-tool-choice), which reject any request carrying tools. Default is True."
+        },
+    )
+    responses_api_lang_prompt_position: Literal["system", "before_user"] = field(
+        default="system",
+        metadata={
+            "help": "Where --enable_lang_prompt puts the language instruction: 'system' appends it to the system "
+            "prompt; 'before_user' sends it as a system note right before the latest user message, which keeps "
+            "small models from drifting into the conversation's dominant language. Default is 'system'."
+        },
+    )
+    responses_api_lang_note_template: str = field(
+        default=LANGUAGE_INSTRUCTION_TEMPLATE,
+        metadata={
+            "help": "Text of the 'before_user' language note; '{language}' is replaced with the detected language "
+            f"name. Default is {LANGUAGE_INSTRUCTION_TEMPLATE!r}."
+        },
     )
     responses_api_stream: bool = field(
         default=True,

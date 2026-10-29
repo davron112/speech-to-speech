@@ -23,6 +23,16 @@ from speech_to_speech.utils.utils import TORCH_DEVICES, resolve_device
 
 logger = logging.getLogger(__name__)
 
+POCKET_LANGUAGE_BY_CODE = {
+    "en": "english",
+    "de": "german",
+    "fr": "french",
+    "it": "italian",
+    "pt": "portuguese",
+    "es": "spanish",
+    "nl": "dutch",
+}
+
 
 class PocketTTSHandler(BaseHandler[TTSIn, TTSOut]):
     """
@@ -45,6 +55,7 @@ class PocketTTSHandler(BaseHandler[TTSIn, TTSOut]):
         model_name: str | None = None,
         temperature: float | None = None,
         eos_threshold: float | None = None,
+        extra_languages: str = "",
     ) -> None:
         """
         Initialize Pocket TTS handler.
@@ -63,6 +74,8 @@ class PocketTTSHandler(BaseHandler[TTSIn, TTSOut]):
             model_name: Pocket TTS Farsi v2 model ID, or None for the selected language.
             temperature: Sampling temperature, or the model config default.
             eos_threshold: End-of-speech threshold, defaults to -2 for Farsi.
+            extra_languages: Comma-separated Pocket TTS languages loaded next to `language` and
+                selected per response from its language code.
         """
         self.should_listen = should_listen
         self.cancel_scope = cancel_scope
@@ -81,6 +94,9 @@ class PocketTTSHandler(BaseHandler[TTSIn, TTSOut]):
         self.is_farsi = model_name == "mehdi-hf/pocket-tts-farsi-v2"
         self.max_tokens = min(max_tokens, 18) if self.is_farsi else max_tokens
         self.phonemizer: PersianPhonemizer | None = None
+        extra = [name.strip() for name in extra_languages.split(",") if name.strip() and name.strip() != language]
+        if self.is_farsi and extra:
+            raise ValueError("Pocket TTS extra_languages cannot be combined with the Farsi model")
         if self.is_farsi and voice in {"alba", "marius", "javert", "jean", "fantine", "cosette", "eponine", "azelma"}:
             raise ValueError(
                 "Pocket TTS Farsi requires a reference audio file or URL via --pocket_tts_voice; preset voice states are incompatible with these weights."
@@ -150,13 +166,36 @@ class PocketTTSHandler(BaseHandler[TTSIn, TTSOut]):
         else:
             self.voice_state = self.model.get_state_for_audio_prompt(voice)
 
+        self._language_voices: dict[str, tuple[Any, Any]] = {self.language: (self.model, self.voice_state)}
+        for extra_language in extra:
+            logger.info("Loading extra Pocket TTS language: %s", extra_language)
+            model = TTSModel.load_model(language=extra_language, **load_kwargs)
+            if self.device != "cpu":
+                model = model.to(self.device)
+            self._language_voices[extra_language] = (model, model.get_state_for_audio_prompt(voice))
+
         logger.info(f"Pocket TTS model sample rate: {self.model.sample_rate}")
+
+    def _voice_for(self, language_code: str | None) -> tuple[Any, Any]:
+        language_voices = getattr(self, "_language_voices", {})
+        code = (language_code or "").split("-")[0].lower()
+        language = POCKET_LANGUAGE_BY_CODE.get(code)
+        if language is not None:
+            matches = [name for name in language_voices if name.split("_")[0] == language]
+            if matches:
+                self._last_language = matches[0]
+                return language_voices[matches[0]]
+        last = getattr(self, "_last_language", None)
+        if language_code is None and last in language_voices:
+            return language_voices[last]
+        return self.model, self.voice_state
 
     def _generate_audio(
         self,
         text: str,
         generation: int | None,
         on_first_provider_audio: Callable[[float], None] | None = None,
+        language_code: str | None = None,
     ) -> Iterator[Any]:
         def cancelled() -> bool:
             return generation is not None and self.cancel_scope is not None and self.cancel_scope.is_stale(generation)
@@ -164,8 +203,9 @@ class PocketTTSHandler(BaseHandler[TTSIn, TTSOut]):
         phonemizer = getattr(self, "phonemizer", None)
         if phonemizer is None:
             if not cancelled():
-                for audio in self.model.generate_audio_stream(
-                    self.voice_state,
+                model, voice_state = self._voice_for(language_code)
+                for audio in model.generate_audio_stream(
+                    voice_state,
                     text,
                     max_tokens=self.max_tokens,
                     copy_state=True,
@@ -359,6 +399,7 @@ class PocketTTSHandler(BaseHandler[TTSIn, TTSOut]):
 
     def on_session_end(self) -> None:
         self._failed_responses.clear()
+        self._last_language = None
 
     def _stream_pcm(self, tts_input: TTSInput, text: str, gen: int | None) -> Iterator[TTSOut]:
         pipeline_start = perf_counter()
@@ -398,7 +439,9 @@ class PocketTTSHandler(BaseHandler[TTSIn, TTSOut]):
                 first_yielded = False
             yield block
 
-        for audio_chunk in self._generate_audio(text, gen, record_first_provider_audio):
+        for audio_chunk in self._generate_audio(
+            text, gen, record_first_provider_audio, language_code=tts_input.tts_language_code
+        ):
             if cancelled():
                 logger.info("TTS generation cancelled (interruption)")
                 return

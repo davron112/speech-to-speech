@@ -293,6 +293,36 @@ def parse_function_call(function_string: str, pattern_to_match: list[str] = []) 
     return _parse_function_exprs(expressions, pattern_to_match)
 
 
+NATIVE_ENTER_CODE = "<tool_call>"
+NATIVE_END_CODE = "</tool_call>"
+_NATIVE_FUNCTION_RE = re.compile(r"<function=([\w.-]+)>(.*?)</function>", re.DOTALL)
+_NATIVE_PARAMETER_RE = re.compile(r"<parameter=([\w.-]+)>\s*(.*?)\s*</parameter>", re.DOTALL)
+
+
+def _native_value(raw: str) -> Any:
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return raw
+
+
+def alias_native_tool_markers(text: str, enter_code: str, end_code: str) -> str:
+    """Map a model's native ``<tool_call>`` delimiters onto the prompted code-block delimiters."""
+    return text.replace(NATIVE_ENTER_CODE, enter_code).replace(NATIVE_END_CODE, end_code)
+
+
+def native_function_calls_to_python(text: str) -> str:
+    """Rewrite Qwen-style ``<function=name><parameter=k>v</parameter></function>`` calls as ``name(k=v)``."""
+
+    def to_call(match: re.Match[str]) -> str:
+        arguments = ", ".join(
+            f"{name}={_native_value(value)!r}" for name, value in _NATIVE_PARAMETER_RE.findall(match.group(2))
+        )
+        return f"{match.group(1)}({arguments})"
+
+    return _NATIVE_FUNCTION_RE.sub(to_call, text)
+
+
 def extract_function_calls_from_text(text: str, block_regex: str = ".*") -> Tuple[str, List[FunctionToolCall]]:
     """Extract function calls from delimited code blocks inside *text*.
 
@@ -319,7 +349,7 @@ def extract_function_calls_from_text(text: str, block_regex: str = ".*") -> Tupl
         return text, []
 
     outside = re.sub(block_regex, "", text, flags=re.DOTALL)
-    inside = " ".join(match.group(0) for match in matches).strip()
+    inside = native_function_calls_to_python(" ".join(match.group(0) for match in matches)).strip()
     if not inside:
         return outside, []
 

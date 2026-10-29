@@ -94,6 +94,7 @@ class _FakeChat:
 
 class _FakeClient:
     def __init__(self, *a, **k):
+        self.init_kwargs = k
         self.chat = _FakeChat()
         self.last_options = None
 
@@ -102,7 +103,7 @@ class _FakeClient:
         return self
 
 
-def _make_handler(stream=True, *, base_url="http://fake/v1", reasoning_effort=None):
+def _make_handler(stream=True, *, base_url="http://fake/v1", reasoning_effort=None, **setup_overrides):
     """Build a handler whose warmup hits the fake client (no network)."""
     orig_openai = base_mod.OpenAI
     base_mod.OpenAI = _FakeClient
@@ -111,15 +112,16 @@ def _make_handler(stream=True, *, base_url="http://fake/v1", reasoning_effort=No
             threading.Event(),
             queue.Queue(),
             queue.Queue(),
-            setup_kwargs=dict(
-                model_name="test-model",
-                base_url=base_url,
-                api_key="k",
-                stream=stream,
-                disable_thinking=True,
-                reasoning_effort=reasoning_effort,
-                compact_history=False,
-            ),
+            setup_kwargs={
+                "model_name": "test-model",
+                "base_url": base_url,
+                "api_key": "k",
+                "stream": stream,
+                "disable_thinking": True,
+                "reasoning_effort": reasoning_effort,
+                "compact_history": False,
+                **setup_overrides,
+            },
         )
     finally:
         base_mod.OpenAI = orig_openai
@@ -1019,3 +1021,82 @@ if __name__ == "__main__":
             print(f"FAIL  {t.__name__}: {type(e).__name__}: {e}")
     print(f"\n{len(tests) - failed}/{len(tests)} passed")
     raise SystemExit(1 if failed else 0)
+
+
+_DANCE_TOOL = [{"type": "function", "name": "dance", "parameters": {"type": "object"}}]
+
+
+def test_api_key_uses_bearer_by_default():
+    assert "default_headers" not in _make_handler().client.init_kwargs
+
+
+def test_api_key_header_sends_key_in_custom_header():
+    h = _make_handler(api_key_header="x-api-key")
+    assert h.client.init_kwargs["default_headers"] == {"x-api-key": "k"}
+
+
+def test_api_key_header_falls_back_to_openai_env_key(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "env-key")
+    h = _make_handler(api_key_header="x-api-key", api_key=None)
+    assert h.client.init_kwargs["default_headers"] == {"x-api-key": "env-key"}
+
+
+def test_api_key_header_without_key_fails_fast(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    with pytest.raises(ValueError, match="x-api-key"):
+        _make_handler(api_key_header="x-api-key", api_key=None)
+
+
+def test_tools_are_forwarded_by_default():
+    h = _make_handler(stream=False)
+    _drive(h, tools=_DANCE_TOOL, tool_choice="auto")
+    sent = h.client.chat.completions.last_kwargs
+    assert sent["tools"][0]["function"]["name"] == "dance"
+    assert sent["tool_choice"] == "auto"
+
+
+def test_tools_are_dropped_when_forwarding_disabled():
+    h = _make_handler(stream=False, forward_tools=False)
+    text, tools, _usage, _chat, _end = _drive(h, tools=_DANCE_TOOL, tool_choice="auto")
+    sent = h.client.chat.completions.last_kwargs
+    assert "tools" not in sent and "tool_choice" not in sent
+    assert text == "ok" and tools == []
+
+
+def test_language_prompt_goes_to_system_prompt_by_default():
+    h = _make_handler(stream=False, enable_lang_prompt=True)
+    _drive(h)
+    messages = h.client.chat.completions.last_kwargs["messages"]
+    assert "please reply to my message in german." in messages[0]["content"].lower()
+    assert [m["role"] for m in messages] == ["system", "user"]
+
+
+def test_language_prompt_before_user_keeps_system_prompt_stable():
+    h = _make_handler(stream=False, enable_lang_prompt=True, lang_prompt_position="before_user")
+    _drive(h)
+    messages = h.client.chat.completions.last_kwargs["messages"]
+    assert "please reply" not in messages[0]["content"].lower()
+    assert messages[-2] == {"role": "system", "content": "Please reply to my message in german."}
+    assert messages[-1]["role"] == "user"
+
+
+def test_language_note_is_not_written_to_history():
+    h = _make_handler(stream=False, enable_lang_prompt=True, lang_prompt_position="before_user")
+    _text, _tools, _usage, chat, _end = _drive(h)
+    assert all("Please reply" not in json.dumps(m) for m in ChatCompletionsApiModelHandler._chat_messages(chat))
+
+
+def test_invalid_language_prompt_position_is_rejected():
+    with pytest.raises(ValueError, match="lang_prompt_position"):
+        _make_handler(lang_prompt_position="middle")
+
+
+def test_language_note_template_is_configurable():
+    h = _make_handler(
+        stream=False,
+        enable_lang_prompt=True,
+        lang_prompt_position="before_user",
+        lang_note_template="Reply only in {language}.",
+    )
+    _drive(h)
+    assert h.client.chat.completions.last_kwargs["messages"][-2]["content"] == "Reply only in german."

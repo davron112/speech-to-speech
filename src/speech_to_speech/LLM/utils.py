@@ -2,7 +2,7 @@ import base64
 import io
 import re
 from collections.abc import Callable
-from typing import Optional
+from typing import Any, Optional
 
 import requests  # type: ignore[import-untyped]
 from PIL import Image
@@ -255,9 +255,22 @@ WHISPER_LANGUAGE_TO_LLM_LANGUAGE = {
 }
 
 
-def format_language_instruction(lang_name: str) -> str:
+LANGUAGE_INSTRUCTION_TEMPLATE = "Please reply to my message in {language}."
+
+
+def format_language_instruction(lang_name: str, template: str = LANGUAGE_INSTRUCTION_TEMPLATE) -> str:
     """Build the opt-in language instruction for ``--enable_lang_prompt``."""
-    return f"Please reply to my message in {lang_name}."
+    return template.format(language=lang_name)
+
+
+def insert_before_last_user_message(messages: Any, note: Optional[str]) -> Any:
+    """Return ``messages`` with a system ``note`` placed right before the latest user message."""
+    if not note or not isinstance(messages, list):
+        return messages
+    for index in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[index], dict) and messages[index].get("role") == "user":
+            return [*messages[:index], {"role": "system", "content": note}, *messages[index:]]
+    return messages
 
 
 def language_name_for_prompt(language_code: Optional[str], *, enable: bool) -> Optional[str]:

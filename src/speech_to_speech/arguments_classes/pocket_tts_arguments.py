@@ -33,6 +33,12 @@ class PocketTTSHandlerArguments:
         default="english",
         metadata={"help": "PocketTTS language/model configuration to load."},
     )
+    pocket_tts_extra_languages: str = field(
+        default="",
+        metadata={
+            "help": "Comma-separated Pocket TTS languages (e.g. 'english') loaded next to pocket_tts_language. Each response uses the model matching its language code, falling back to pocket_tts_language."
+        },
+    )
     pocket_tts_model_name: str | None = field(
         default=None,
         metadata={
