@@ -51,6 +51,13 @@ class ResponsesApiLanguageModelHandlerArguments(LanguageModelBaseArguments):
             f"name. Default is {LANGUAGE_INSTRUCTION_TEMPLATE!r}."
         },
     )
+    responses_api_request_timeout_s: float = field(
+        default=20.0,
+        metadata={
+            "help": "Seconds to wait for the API before a turn fails. Raise it for local servers whose first, "
+            "uncached prompt prefill is slow. Default is 20."
+        },
+    )
     responses_api_stream: bool = field(
         default=True,
         metadata={

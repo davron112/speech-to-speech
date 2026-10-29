@@ -1100,3 +1100,9 @@ def test_language_note_template_is_configurable():
     )
     _drive(h)
     assert h.client.chat.completions.last_kwargs["messages"][-2]["content"] == "Reply only in german."
+
+
+def test_request_timeout_is_configurable():
+    h = _make_handler(request_timeout_s=60.0)
+    assert h.request_timeout_s == 60.0
+    assert h.request_timeout.read == 60.0
